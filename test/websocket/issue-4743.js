@@ -140,3 +140,73 @@ test('closing a queued WebSocket does not unblock a later connection to the same
     })
   }
 })
+
+test('rejected handshake releases the CONNECTING queue for the same host and port', async (t) => {
+  const server = createServer()
+  const wss = new WebSocketServer({ noServer: true })
+  const upgrades = []
+  const sockets = new Set()
+  let firstHandshakeFinished = false
+
+  t.after(async () => {
+    for (const socket of sockets) {
+      socket.destroy()
+    }
+
+    await new Promise((resolve) => wss.close(resolve))
+    await new Promise((resolve) => server.close(resolve))
+  })
+
+  server.on('upgrade', (req, socket, head) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+
+    const upgrade = { req, socket, head, afterFirstHandshake: firstHandshakeFinished }
+    upgrades.push(upgrade)
+
+    server.emit('upgrade-recorded', upgrade)
+  })
+
+  server.listen(0)
+  await once(server, 'listening')
+
+  const first = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
+  first.onerror = () => {}
+  t.after(() => {
+    first.onerror = null
+    first.close()
+  })
+
+  const [firstUpgrade] = await once(server, 'upgrade-recorded')
+  const second = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
+  t.after(() => {
+    second.onerror = null
+    second.close()
+  })
+
+  await delay(100)
+  t.assert.strictEqual(upgrades.length, 1)
+
+  rejectUpgrade(firstUpgrade)
+  await once(first, 'close')
+  firstHandshakeFinished = true
+
+  const [secondUpgrade] = await once(server, 'upgrade-recorded')
+  t.assert.strictEqual(secondUpgrade.afterFirstHandshake, true)
+
+  handleUpgrade(secondUpgrade)
+  await once(second, 'open')
+
+  second.close()
+
+  function rejectUpgrade ({ socket }) {
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    socket.destroy()
+  }
+
+  function handleUpgrade ({ req, socket, head }) {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.close()
+    })
+  }
+})
